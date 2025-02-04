@@ -13,6 +13,8 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use super::KeyEncode;
 
@@ -96,15 +98,27 @@ impl Datastore {
 		// Set minimum number of write buffers to merge
 		info!(target: TARGET, "Minimum write buffers to merge: {}", *cnf::ROCKSDB_MIN_WRITE_BUFFER_NUMBER_TO_MERGE);
 		opts.set_min_write_buffer_number_to_merge(*cnf::ROCKSDB_MIN_WRITE_BUFFER_NUMBER_TO_MERGE);
+		// Delay compaction until the minimum number of files accumulate
+		info!(target: TARGET, "Number of files to trigger compaction: {}", *cnf::ROCKSDB_FILE_COMPACTION_TRIGGER);
+		opts.set_level_zero_file_num_compaction_trigger(*cnf::ROCKSDB_FILE_COMPACTION_TRIGGER);
+		// Set the compaction readahead size
+		info!(target: TARGET, "Compaction readahead size: {}", *cnf::ROCKSDB_COMPACTION_READAHEAD_SIZE);
+		opts.set_compaction_readahead_size(*cnf::ROCKSDB_COMPACTION_READAHEAD_SIZE);
+		// Set the max number of subcompactions
+		info!(target: TARGET, "Maximum concurrent subcompactions: {}", *cnf::ROCKSDB_MAX_CONCURRENT_SUBCOMPACTIONS);
+		opts.set_max_subcompactions(*cnf::ROCKSDB_MAX_CONCURRENT_SUBCOMPACTIONS);
 		// Use separate write thread queues
 		info!(target: TARGET, "Use separate thread queues: {}", *cnf::ROCKSDB_ENABLE_PIPELINED_WRITES);
 		opts.set_enable_pipelined_write(*cnf::ROCKSDB_ENABLE_PIPELINED_WRITES);
 		// Enable separation of keys and values
 		info!(target: TARGET, "Enable separation of keys and values: {}", *cnf::ROCKSDB_ENABLE_BLOB_FILES);
 		opts.set_enable_blob_files(*cnf::ROCKSDB_ENABLE_BLOB_FILES);
-		// Store 4KB values separate from keys
+		// Store large values separate from keys
 		info!(target: TARGET, "Minimum blob value size: {}", *cnf::ROCKSDB_MIN_BLOB_SIZE);
 		opts.set_min_blob_size(*cnf::ROCKSDB_MIN_BLOB_SIZE);
+		// Set the write-ahead-log size limit in MB
+		info!(target: TARGET, "Write-ahead-log file size limit: {}MB", *cnf::ROCKSDB_WAL_SIZE_LIMIT);
+		opts.set_wal_size_limit_mb(*cnf::ROCKSDB_WAL_SIZE_LIMIT);
 		// Allow multiple writers to update memtables in parallel
 		info!(target: TARGET, "Allow concurrent memtable writes: true");
 		opts.set_allow_concurrent_memtable_write(true);
@@ -114,6 +128,8 @@ impl Datastore {
 		// Improve concurrency from write batch mutex
 		info!(target: TARGET, "Allow adaptive write thread yielding: true");
 		opts.set_enable_write_thread_adaptive_yield(true);
+		// Log if writes should be synced
+		info!(target: TARGET, "Wait for disk sync acknowledgement: {}", *cnf::SYNC_DATA);
 		// Set the block cache size in bytes
 		info!(target: TARGET, "Block cache size: {}", *cnf::ROCKSDB_BLOCK_CACHE_SIZE);
 		// Configure the in-memory cache options
@@ -121,12 +137,20 @@ impl Datastore {
 		// Configure the block based file options
 		let mut block_opts = BlockBasedOptions::default();
 		block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-		block_opts.set_hybrid_ribbon_filter(10.0, 2);
+		block_opts.set_pin_top_level_index_and_filter(true);
+		block_opts.set_bloom_filter(10.0, false);
+		block_opts.set_block_size(*cnf::ROCKSDB_BLOCK_SIZE);
 		block_opts.set_block_cache(&cache);
 		// Configure the database with the cache
 		opts.set_block_based_table_factory(&block_opts);
 		opts.set_blob_cache(&cache);
 		opts.set_row_cache(&cache);
+		// Configure memory-mapped reads
+		info!(target: TARGET, "Enable memory-mapped reads: {}", *cnf::ROCKSDB_ENABLE_MEMORY_MAPPED_READS);
+		opts.set_allow_mmap_reads(true);
+		// Configure memory-mapped writes
+		info!(target: TARGET, "Enable memory-mapped writes: {}", *cnf::ROCKSDB_ENABLE_MEMORY_MAPPED_WRITES);
+		opts.set_allow_mmap_writes(true);
 		// Set the delete compaction factory
 		info!(target: TARGET, "Setting delete compaction factory: {} / {} ({})",
 			*cnf::ROCKSDB_DELETION_FACTORY_WINDOW_SIZE,
@@ -167,9 +191,49 @@ impl Datastore {
 				return Err(Error::Ds(format!("Invalid storage engine log level specified: {l}")));
 			}
 		});
-		// Create the datastore
+		// Configure background WAL flush behaviour
+		let db = match *cnf::ROCKSDB_BACKGROUND_FLUSH {
+			// Beckground flush is disabled which
+			// means that the WAL will be flushed
+			// whenever a transaction is committed.
+			false => {
+				// Dispay the configuration setting
+				info!(target: TARGET, "Background write-ahead-log flushing: disabled");
+				// Enable manual WAL flush
+				opts.set_manual_wal_flush(false);
+				// Create the optimistic datastore
+				Arc::pin(OptimisticTransactionDB::open(&opts, path)?)
+			}
+			// Background flush is enabled so we
+			// spawn a background worker thread to
+			// flush the WAL to disk periodically.
+			true => {
+				// Dispay the configuration setting
+				info!(target: TARGET, "Background write-ahead-log flushing: enabled every {}ms", *cnf::ROCKSDB_BACKGROUND_FLUSH_INTERVAL);
+				// Enable manual WAL flush
+				opts.set_manual_wal_flush(true);
+				// Create the optimistic datastore
+				let db = Arc::pin(OptimisticTransactionDB::open(&opts, path)?);
+				// Clone the database reference
+				let dbc = db.clone();
+				// Create a new background thread
+				thread::spawn(move || loop {
+					// Get the specified flush interval
+					let wait = *cnf::ROCKSDB_BACKGROUND_FLUSH_INTERVAL;
+					// Wait for the specified interval
+					thread::sleep(Duration::from_millis(wait));
+					// Flush the WAL to disk periodically
+					if let Err(err) = dbc.flush_wal(true) {
+						error!("Failed to flush WAL: {err}");
+					}
+				});
+				// Return the datastore
+				db
+			}
+		};
+		// Return the datastore
 		Ok(Datastore {
-			db: Arc::pin(OptimisticTransactionDB::open(&opts, path)?),
+			db,
 		})
 	}
 	/// Shutdown the database
@@ -196,7 +260,7 @@ impl Datastore {
 		to.set_snapshot(true);
 		// Set the write options
 		let mut wo = WriteOptions::default();
-		wo.set_sync(false);
+		wo.set_sync(*cnf::SYNC_DATA);
 		// Create a new transaction
 		let inner = self.db.transaction_opt(&wo, &to);
 		// The database reference must always outlive
