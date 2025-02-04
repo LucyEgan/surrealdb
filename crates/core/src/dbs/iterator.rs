@@ -324,7 +324,7 @@ impl Iterator {
 		//TODO store exec id
 		//TODO log a surrealdb::slowlog::complete message for exec id
 		//TODO any that dont show a complete then count as running
-		
+
 		// Check if we actually need to process and iterate over the results
 		if plan.do_iterate {
 			// Process prepared values
