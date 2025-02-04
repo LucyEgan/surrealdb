@@ -13,6 +13,7 @@ mod processor;
 mod response;
 mod result;
 mod session;
+mod slow_log;
 mod statement;
 mod store;
 mod variables;

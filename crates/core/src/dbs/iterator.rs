@@ -2,6 +2,7 @@ use crate::ctx::Context;
 use crate::ctx::{Canceller, MutableContext};
 use crate::dbs::distinct::SyncDistinct;
 use crate::dbs::plan::Plan;
+use crate::dbs::slow_log::SlowLog;
 use crate::dbs::result::Results;
 use crate::dbs::Options;
 use crate::dbs::Statement;
@@ -319,76 +320,11 @@ impl Iterator {
 		)?;
 		// Extract the expected behaviour depending on the presence of EXPLAIN with or without FULL
 		let mut plan = Plan::new(ctx, stm, &self.entries, &self.results);
+		let slow_log = SlowLog::new(stm, &self.entries);
 		//TODO store exec id
 		//TODO log a surrealdb::slowlog::complete message for exec id
 		//TODO any that dont show a complete then count as running
-		for iter in &self.entries {
-			match iter {
-				Iterable::Value(_v) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Value)");
-				}
-				Iterable::Yield(_t) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Yield)");
-				}
-				Iterable::Thing(_t) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Thing)");
-				}
-				Iterable::Defer(_t) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Defer)");
-				}
-				Iterable::Edges(_e) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Edges)");
-				}
-				Iterable::Table(_t, rs) => {
-					match rs {
-						RecordStrategy::Count => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Table Count)");
-						}
-						RecordStrategy::KeysOnly => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Table Keys)");
-						}
-						RecordStrategy::KeysAndValues => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Table)");
-						}
-					};
-				}
-				Iterable::Range(_tb, _r, rs) => {
-					match rs {
-						RecordStrategy::Count => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Range Count)");
-						}
-						RecordStrategy::KeysOnly => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Range Keys)");
-						}
-						RecordStrategy::KeysAndValues => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Range)");
-						}
-					};
-				}
-				Iterable::Mergeable(_t, _v) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Mergeable)");
-				}
-				Iterable::Relatable(_t1, _t2, _t3, None) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Relatable)");
-				}
-				Iterable::Relatable(_t1, _t2, _t3, Some(_v)) => {
-					trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Relatable)");
-				}
-				Iterable::Index(_t, _ir, rs) => {
-					match rs {
-						RecordStrategy::Count => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Index Count)");
-						}
-						RecordStrategy::KeysOnly => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Index Keys)");
-						}
-						RecordStrategy::KeysAndValues => {
-							trace!(target: "surrealdb::slowlog", statement = %stm, "SLOW_QUERY Query(Iterate Index)");
-						}
-					};
-				}
-			}
-		}
+		
 		// Check if we actually need to process and iterate over the results
 		if plan.do_iterate {
 			// Process prepared values
@@ -450,6 +386,8 @@ impl Iterator {
 				results.push(v)
 			}
 		}
+
+		slow_log.complete(&self.results);
 
 		// Output the results
 		Ok(results.into())
