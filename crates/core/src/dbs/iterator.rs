@@ -304,7 +304,7 @@ impl Iterator {
 		rs: RecordStrategy,
 	) -> Result<Value, Error> {
 		// Log the statement
-		trace!(target: TARGET, statement = %stm, "Iterating statement");
+		trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "Iterating statement");
 		// Enable context override
 		let mut cancel_ctx = MutableContext::new(ctx);
 		self.run = cancel_ctx.add_cancel();

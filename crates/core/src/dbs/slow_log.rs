@@ -23,37 +23,37 @@ impl SlowLog {
 			match iter {
 				Iterable::Value(_v) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Value)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Value)");
 				}
 				Iterable::Yield(_t) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Yield)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Yield)");
 				}
 				Iterable::Thing(_t) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Thing)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Thing)");
 				}
 				Iterable::Defer(_t) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Defer)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Defer)");
 				}
 				Iterable::Edges(_e) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Edges)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Edges)");
 				}
 				Iterable::Table(_t, rs) => {
 					match rs {
 						RecordStrategy::Count => {
 							//query_log_level unindexed
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Table Count)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Table Count)");
 						}
 						RecordStrategy::KeysOnly => {
 							//query_log_level unindexed
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Table Keys)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Table Keys)");
 						}
 						RecordStrategy::KeysAndValues => {
 							//query_log_level unindexed
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Table)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Table)");
 						}
 					};
 				}
@@ -61,43 +61,43 @@ impl SlowLog {
 					match rs {
 						RecordStrategy::Count => {
 							//query_log_level all
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Range Count)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Range Count)");
 						}
 						RecordStrategy::KeysOnly => {
 							//query_log_level all
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Range Keys)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Range Keys)");
 						}
 						RecordStrategy::KeysAndValues => {
 							//query_log_level all
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Range)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Range)");
 						}
 					};
 				}
 				Iterable::Mergeable(_t, _v) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Mergeable)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Mergeable)");
 				}
 				Iterable::Relatable(_t1, _t2, _t3, None) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Relatable)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Relatable)");
 				}
 				Iterable::Relatable(_t1, _t2, _t3, Some(_v)) => {
 					//query_log_level all
-					trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Relatable)");
+					trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Relatable)");
 				}
 				Iterable::Index(_t, _ir, rs) => {
 					match rs {
 						RecordStrategy::Count => {
 							//query_log_level all
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Index Count)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Index Count)");
 						}
 						RecordStrategy::KeysOnly => {
 							//query_log_level all
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Index Keys)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Index Keys)");
 						}
 						RecordStrategy::KeysAndValues => {
 							//query_log_level all
-							trace!(target: TARGET, statement = %stm, "QueryMethod(Iterate Index)");
+							trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "QueryMethod(Iterate Index)");
 						}
 					};
 				}
@@ -110,6 +110,6 @@ impl SlowLog {
 
 impl SlowLog {
 	pub(crate) fn complete(&self, _results: &Results) {
-		todo!()
+		// todo!()
 	}
 }
