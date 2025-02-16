@@ -1,7 +1,7 @@
 use super::MlExportConfig;
 use crate::{opt::Resource, value::Notification, Result};
+use async_channel::Sender;
 use bincode::Options;
-use channel::Sender;
 use revision::Revisioned;
 use serde::{ser::SerializeMap as _, Serialize};
 use std::borrow::Cow;
@@ -634,6 +634,7 @@ impl Revisioned for RouterRequest {
 			serializer
 				.serialize_into(&mut *w, "params")
 				.map_err(|err| revision::Error::Serialize(err.to_string()))?;
+
 			x.serialize_revisioned(w)?;
 		}
 
