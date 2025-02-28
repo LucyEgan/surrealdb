@@ -5,16 +5,12 @@ use crate::idx::planner::RecordStrategy;
 const TARGET: &str = "surrealdb::core::dbs::slow_log";
 
 pub(super) struct SlowLog {
-	// pub(super) do_iterate: bool,
-	// pub(super) explanation: Option<Explanation>,
 }
 
 impl SlowLog {
 	pub(super) fn new(
-		// ctx: &Context,
 		stm: &Statement<'_>,
 		iterables: &Vec<Iterable>,
-		// results: &Results,
 	) -> Self {
 		//query_log_level = none, slow, unindexed, all
 		// let query_log_level = 4;
