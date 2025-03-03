@@ -19,7 +19,7 @@ surrealdb = { version = "=2.3.0", package = "surrealdb", path = "./crates/sdk" }
 
 # External surreal crates
 surrealcs = { version = "0.4.4" }
-surrealkv = { version = "0.8.1" }
+surrealkv = { version = "0.9.1" }
 surrealml = { version = "0.1.1", package = "surrealml-core" }
 affinitypool = { version = "0.3.1" }
 dmp = "0.2.0"
@@ -80,7 +80,7 @@ jemallocator = { version = "0.6.0", package = "tikv-jemallocator" }
 jsonwebtoken = "9.3.0"
 linfa-linalg = "=0.1.0"
 md-5 = "0.10.6"
-mimalloc = { version = "0.1.43",  default-features = false }
+mimalloc = { version = "0.1.43", default-features = false }
 nanoid = "0.4.0"
 native-tls = "0.2.11"
 ndarray = "=0.15.6"
@@ -155,6 +155,7 @@ wiremock = "0.6.0"
 # Public features
 default = [
     "allocator",
+    "allocation-tracking",
     "storage-mem",
     "storage-surrealkv",
     "storage-surrealcs",
