@@ -2,7 +2,7 @@ use crate::ctx::Context;
 use crate::ctx::{Canceller, MutableContext};
 use crate::dbs::distinct::SyncDistinct;
 use crate::dbs::plan::{Explanation, Plan};
-use crate::dbs::slow_log::SlowLog;
+use crate::dbs::slow_log::{slow_log};
 use crate::dbs::result::Results;
 use crate::dbs::Options;
 use crate::dbs::Statement;
@@ -355,7 +355,7 @@ impl Iterator {
 		rs: RecordStrategy,
 	) -> Result<Value, Error> {
 		// Log the statement
-		trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "Iterating statement");
+		trace!(target: TARGET, statement = %stm.to_string().replace("\n", "\\n"), "Iterating statement(NS:{},DB:{},Iterators: {})", opt.ns().ok(), opt.db().ok(), slow_log(&self.entries));
 		// Enable context override
 		let mut cancel_ctx = MutableContext::new(ctx);
 		self.run = cancel_ctx.add_cancel();
@@ -374,10 +374,6 @@ impl Iterator {
 		)?;
 		// Extract the expected behaviour depending on the presence of EXPLAIN with or without FULL
 		let mut plan = Plan::new(ctx, stm, &self.entries, &self.results);
-		let slow_log = SlowLog::new(stm, &self.entries);
-		//TODO store exec id
-		//TODO log a surrealdb::slowlog::complete message for exec id
-		//TODO any that dont show a complete then count as running
 
 		// Check if we actually need to process and iterate over the results
 		if plan.do_iterate {
@@ -448,7 +444,6 @@ impl Iterator {
 			}
 		}
 
-		slow_log.complete(&self.results);
 
 		// Output the results
 		Ok(results.into())
