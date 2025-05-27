@@ -3,8 +3,11 @@ use crate::dbs::Options;
 use crate::dbs::Statement;
 use crate::doc::Document;
 use crate::err::Error;
-use crate::sql::value::Value;
+use crate::expr::value::Value;
+use anyhow::anyhow;
 use reblessive::tree::Stk;
+
+use super::IgnoreError;
 
 impl Document {
 	pub(super) async fn upsert(
@@ -13,41 +16,40 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<Value, Error> {
-		// On the first iteration, we do not first attempt
-		// to fetch the record from the storage engine. After
-		// trying to create the record, if the record already
-		// exists then we will fetch the record from storage,
-		// and will update the record subsequently
-		match self.is_iteration_initial() {
-			// We haven't yet checked if the record exists
-			// so let's assume that the record does not exist
-			// and attempt to create the record in the database
-			true => match self.upsert_create(stk, ctx, opt, stm).await {
+	) -> Result<Value, IgnoreError> {
+		// Even though we haven't tried to create first this can still not be the 'initial iteration' if
+		// the initial doc is not set.
+		//
+		// If this is not the initial iteration we immediatly skip trying to create and go straight
+		// to updating.
+		if !self.is_iteration_initial() {
+			return self.upsert_update(stk, ctx, opt, stm).await;
+		}
+
+		ctx.tx().lock().await.new_save_point();
+
+		// First try to create the value and if that is not possible due to an existing value fall
+		// back to update instead.
+		//
+		// This is done this way to make the create path fast and take priority over the update
+		// path.
+		let retry = match self.upsert_create(stk, ctx, opt, stm).await {
+			Err(IgnoreError::Error(e)) => match e.downcast() {
 				// We received an index exists error, so we
 				// ignore the error, and attempt to update the
 				// record using the ON DUPLICATE KEY UPDATE
 				// clause with the ID received in the error
-				Err(Error::IndexExists {
+				Ok(Error::IndexExists {
 					thing,
-					index,
-					value,
-				}) => match self.is_specific_record_id() {
-					// No specific Record ID has been specified, so retry
-					false => Err(Error::RetryWithId(thing)),
-					// A specific Record ID was specified, so error
-					true => Err(Error::IndexExists {
-						thing,
-						index,
-						value,
-					}),
-				},
+					..
+				}) if !self.is_specific_record_id() => thing,
 				// We attempted to INSERT a document with an ID,
 				// and this ID already exists in the database,
 				// so we need to UPDATE the record instead.
-				Err(Error::RecordExists {
+				Ok(Error::RecordExists {
 					thing,
-				}) => Err(Error::RetryWithId(thing)),
+				}) => thing,
+
 				// If an error was received, but this statement
 				// is potentially retryable because it might
 				// depend on any initially stored value, then we
@@ -56,21 +58,44 @@ impl Document {
 				// need to presume that we might need to retry
 				// after fetching the initial record value
 				// from storage before processing schema again.
-				Err(e) if e.is_schema_related() && stm.is_repeatable() => {
-					Err(Error::RetryWithId(self.inner_id()?))
+				Ok(e) => {
+					if e.is_schema_related() && stm.is_repeatable() {
+						self.inner_id()?
+					} else {
+						return Err(IgnoreError::Error(anyhow!(e)));
+					}
 				}
-				// If any other error was received, then let's
-				// pass that error through and return an error
-				Err(e) => Err(e),
-				// Otherwise the record creation succeeded
-				Ok(v) => Ok(v),
+				Err(e) => {
+					ctx.tx().lock().await.rollback_to_save_point().await?;
+					return Err(IgnoreError::Error(e));
+				}
 			},
-			// If we first attempted to create the record,
-			// but the record existed already, then we will
-			// fetch the record from the storage engine,
-			// and will update the record subsequently
-			false => self.upsert_update(stk, ctx, opt, stm).await,
+			Err(IgnoreError::Ignore) => {
+				ctx.tx().lock().await.release_last_save_point()?;
+				return Err(IgnoreError::Ignore);
+			}
+			Ok(x) => {
+				ctx.tx().lock().await.release_last_save_point()?;
+				return Ok(x);
+			}
+		};
+
+		// Create failed so now fall back to running an update.
+
+		ctx.tx().lock().await.rollback_to_save_point().await?;
+
+		if ctx.is_done(true).await? {
+			return Err(IgnoreError::Ignore);
 		}
+
+		let (ns, db) = opt.ns_db()?;
+		let val = ctx.tx().get_record(ns, db, &retry.tb, &retry.id, opt.version).await?;
+
+		self.modify_for_update_retry(retry, val);
+
+		self.generate_record_id(stk, ctx, opt, stm).await?;
+
+		self.upsert_update(stk, ctx, opt, stm).await
 	}
 	/// Attempt to run an UPSERT statement to
 	/// create a record which does not exist
@@ -80,7 +105,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<Value, Error> {
+	) -> Result<Value, IgnoreError> {
 		self.check_permissions_quick(stk, ctx, opt, stm).await?;
 		self.check_table_type(ctx, opt, stm).await?;
 		self.check_data_fields(stk, ctx, opt, stm).await?;
@@ -105,7 +130,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<Value, Error> {
+	) -> Result<Value, IgnoreError> {
 		self.check_permissions_quick(stk, ctx, opt, stm).await?;
 		self.check_table_type(ctx, opt, stm).await?;
 		self.check_data_fields(stk, ctx, opt, stm).await?;

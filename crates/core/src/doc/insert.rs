@@ -2,9 +2,14 @@ use crate::ctx::Context;
 use crate::dbs::Options;
 use crate::dbs::Statement;
 use crate::doc::Document;
+use crate::err;
 use crate::err::Error;
-use crate::sql::value::Value;
+use crate::expr::statements::InsertStatement;
+use crate::expr::value::Value;
+use anyhow::Result;
 use reblessive::tree::Stk;
+
+use super::IgnoreError;
 
 impl Document {
 	pub(super) async fn insert(
@@ -12,88 +17,133 @@ impl Document {
 		stk: &mut Stk,
 		ctx: &Context,
 		opt: &Options,
-		stm: &Statement<'_>,
-	) -> Result<Value, Error> {
-		// On the first iteration, this will always be
-		// false, as we do not first attempt to fetch the
-		// record from the storage engine. After attempting
-		// to create the record, if the record already exists
-		// then we will fetch the record from the storage
-		// engine, and will update the record subsequently
-		match self.is_iteration_initial() {
-			// We haven't yet checked if the record exists
-			// so let's assume that the record does not exist
-			// and attempt to create the record in the database
-			true => match self.insert_create(stk, ctx, opt, stm).await {
-				// We received an index exists error, so we
-				// ignore the error, and attempt to update the
-				// record using the ON DUPLICATE KEY UPDATE
-				// clause with the ID received in the error
-				Err(Error::IndexExists {
-					thing,
-					index,
-					value,
-				}) => match stm.is_retryable() {
-					// There is an ON DUPLICATE KEY UPDATE clause
-					true => match self.is_specific_record_id() {
-						// No specific Record ID has been specified, so retry
-						false => Err(Error::RetryWithId(thing)),
-						// A specific Record ID was specified
-						true => match stm.is_ignore() {
-							// There is no IGNORE keyword specified
-							false => Err(Error::IndexExists {
-								thing,
-								index,
-								value,
-							}),
-							// There is an IGNORE keyword specified
-							true => Err(Error::Ignore),
-						},
-					},
-					// There is no ON DUPLICATE KEY UPDATE clause
-					false => match stm.is_ignore() {
-						// There is no IGNORE keyword specified
-						false => Err(Error::IndexExists {
-							thing,
-							index,
-							value,
-						}),
-						// There is an IGNORE keyword specified
-						true => Err(Error::Ignore),
-					},
-				},
+		stm: &InsertStatement,
+	) -> Result<Value, IgnoreError> {
+		// Even though we haven't tried to create first this can still not be the 'initial iteration' if
+		// the initial doc is not set.
+		//
+		// If this is not the initial iteration we immediatly skip trying to create and go straight
+		// to updating.
+		if !self.is_iteration_initial() {
+			return self.insert_update(stk, ctx, opt, &Statement::Insert(stm)).await;
+		}
+
+		// is this retryable?
+		// it is retryable when some data is present on the insert statement to update.
+		let retryable = stm.update.is_some();
+		if retryable {
+			// it is retryable so generate a save point we can roll back to.
+			ctx.tx().lock().await.new_save_point();
+		}
+
+		// First try to create the value and if that is not possible due to an existing value fall
+		// back to update instead.
+		//
+		// This is done this way to make the create path fast and take priority over the update
+		// path.
+		let retry = match self.insert_create(stk, ctx, opt, &Statement::Insert(stm)).await {
+			// We received an index exists error, so we
+			// ignore the error, and attempt to update the
+			// record using the ON DUPLICATE KEY UPDATE
+			// clause with the ID received in the error
+			Err(IgnoreError::Error(e)) => match e.downcast_ref::<err::Error>() {
+				Some(Error::IndexExists {
+					..
+				}) => {
+					// if not retryable return the error.
+					//
+					// or if the statement contained a specific record id, we
+					// don't retry to
+					if !retryable || self.is_specific_record_id() {
+						if retryable {
+							ctx.tx().lock().await.rollback_to_save_point().await?;
+						}
+
+						// Ignore flag; disables error.
+						// Error::Ignore is never raised to the user.
+						if stm.ignore {
+							return Err(IgnoreError::Ignore);
+						}
+
+						return Err(IgnoreError::Error(e));
+					}
+					let Ok(Error::IndexExists {
+						thing,
+						..
+					}) = e.downcast()
+					else {
+						// Checked above
+						unreachable!()
+					};
+					thing
+				}
 				// We attempted to INSERT a document with an ID,
 				// and this ID already exists in the database,
 				// so we need to update the record instead using
 				// the ON DUPLICATE KEY UPDATE statement clause
-				Err(Error::RecordExists {
-					thing,
-				}) => match stm.is_retryable() {
-					// There is an ON DUPLICATE KEY UPDATE clause
-					true => Err(Error::RetryWithId(thing)),
-					// There is no ON DUPLICATE KEY UPDATE clause
-					false => match stm.is_ignore() {
-						// There is no IGNORE keyword specified
-						false => Err(Error::RecordExists {
-							thing,
-						}),
-						// There is an IGNORE keyword specified
-						true => Err(Error::Ignore),
-					},
-				},
-				// If any other error was received, then let's
-				// pass that error through and return an error
-				Err(e) => Err(e),
-				// Otherwise the record creation succeeded
-				Ok(v) => Ok(v),
+				Some(Error::RecordExists {
+					..
+				}) => {
+					// if not retryable return the error.
+					if !retryable {
+						// Ignore flag; disables error.
+						// Error::Ignore is never raised to the user.
+						if stm.ignore {
+							return Err(IgnoreError::Ignore);
+						}
+						return Err(IgnoreError::Error(e));
+					}
+					let Ok(Error::RecordExists {
+						thing,
+						..
+					}) = e.downcast()
+					else {
+						// Checked above
+						unreachable!()
+					};
+					thing
+				}
+				_ => {
+					// if retryable we need to do something with the savepoint.
+					if retryable {
+						ctx.tx().lock().await.rollback_to_save_point().await?;
+					}
+					return Err(IgnoreError::Error(e));
+				}
 			},
-			// If we first attempted to create the record,
-			// but the record existed already, then we will
-			// fetch the record from the storage engine,
-			// and will update the record subsequently
-			false => self.insert_update(stk, ctx, opt, stm).await,
+			Err(IgnoreError::Ignore) => {
+				if retryable {
+					ctx.tx().lock().await.release_last_save_point()?;
+				}
+				return Err(IgnoreError::Ignore);
+			}
+			Ok(x) => {
+				if retryable {
+					ctx.tx().lock().await.release_last_save_point()?;
+				}
+				return Ok(x);
+			}
+		};
+
+		// Insertion failed so instead do an update.
+		ctx.tx().lock().await.rollback_to_save_point().await?;
+
+		if ctx.is_done(true).await? {
+			// Don't process the document
+			return Err(IgnoreError::Ignore);
 		}
+
+		let (ns, db) = opt.ns_db()?;
+		let val = ctx.tx().get_record(ns, db, &retry.tb, &retry.id, opt.version).await?;
+
+		self.modify_for_update_retry(retry, val);
+
+		// we restarted, so we might need to generate a record id again?
+		self.generate_record_id(stk, ctx, opt, &Statement::Insert(stm)).await?;
+
+		self.insert_update(stk, ctx, opt, &Statement::Insert(stm)).await
 	}
+
 	/// Attempt to run an INSERT statement to
 	/// create a record which does not exist
 	async fn insert_create(
@@ -102,7 +152,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<Value, Error> {
+	) -> Result<Value, IgnoreError> {
 		self.check_permissions_quick(stk, ctx, opt, stm).await?;
 		self.check_table_type(ctx, opt, stm).await?;
 		self.check_data_fields(stk, ctx, opt, stm).await?;
@@ -128,7 +178,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<Value, Error> {
+	) -> Result<Value, IgnoreError> {
 		self.check_permissions_quick(stk, ctx, opt, stm).await?;
 		self.check_table_type(ctx, opt, stm).await?;
 		self.check_data_fields(stk, ctx, opt, stm).await?;

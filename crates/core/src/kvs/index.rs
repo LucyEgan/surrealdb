@@ -1,34 +1,37 @@
+use super::KeyDecode;
 use crate::cnf::{INDEXING_BATCH_SIZE, NORMAL_FETCH_SIZE};
 use crate::ctx::{Context, MutableContext};
 use crate::dbs::Options;
 use crate::doc::{CursorDoc, Document};
 use crate::err::Error;
+use crate::expr::statements::DefineIndexStatement;
+use crate::expr::{Id, Object, Thing, Value};
 use crate::idx::index::IndexOperation;
 use crate::key::index::ia::Ia;
 use crate::key::index::ip::Ip;
 use crate::key::thing;
-use crate::kvs::ds::TransactionFactory;
 use crate::kvs::LockType::Optimistic;
+use crate::kvs::ds::TransactionFactory;
 use crate::kvs::{Key, Transaction, TransactionType, Val};
-use crate::sql::statements::DefineIndexStatement;
-use crate::sql::{Id, Object, Thing, Value};
-use dashmap::mapref::entry::Entry;
+use crate::mem::ALLOC;
+use anyhow::{Result, ensure};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use futures::channel::oneshot::{Receiver, Sender, channel};
 use reblessive::TreeStack;
 use revision::revisioned;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tokio::task;
 use tokio::task::JoinHandle;
 
-use super::KeyDecode;
-
 #[derive(Debug, Clone)]
 pub(crate) enum BuildingStatus {
 	Started,
+	Cleaning,
 	Indexing {
 		initial: Option<usize>,
 		updated: Option<usize>,
@@ -40,7 +43,7 @@ pub(crate) enum BuildingStatus {
 		pending: Option<usize>,
 	},
 	Aborted,
-	Error(Arc<Error>),
+	Error(String),
 }
 
 impl Default for BuildingStatus {
@@ -74,6 +77,7 @@ impl From<BuildingStatus> for Value {
 		let mut o = Object::default();
 		let s = match st {
 			BuildingStatus::Started => "started",
+			BuildingStatus::Cleaning => "cleaning",
 			BuildingStatus::Indexing {
 				initial,
 				pending,
@@ -152,36 +156,63 @@ impl IndexBuilder {
 		}
 	}
 
+	fn start_building(
+		&self,
+		ctx: &Context,
+		opt: Options,
+		ix: Arc<DefineIndexStatement>,
+		sdr: Option<Sender<Result<()>>>,
+	) -> Result<IndexBuilding> {
+		let building = Arc::new(Building::new(ctx, self.tf.clone(), opt, ix)?);
+		let b = building.clone();
+		let jh = task::spawn(async move {
+			let r = b.run().await;
+			if let Err(err) = &r {
+				b.set_status(BuildingStatus::Error(err.to_string())).await;
+			}
+			if let Some(s) = sdr {
+				if s.send(r).is_err() {
+					warn!("Failed to send index building result to the consumer");
+				}
+			}
+		});
+		Ok((building, jh))
+	}
+
 	pub(crate) fn build(
 		&self,
 		ctx: &Context,
 		opt: Options,
 		ix: Arc<DefineIndexStatement>,
-	) -> Result<(), Error> {
+		blocking: bool,
+	) -> Result<Option<Receiver<Result<()>>>> {
 		let (ns, db) = opt.ns_db()?;
 		let key = IndexKey::new(ns, db, &ix.what, &ix.name);
+		let (rcv, sdr) = if blocking {
+			let (s, r) = channel();
+			(Some(r), Some(s))
+		} else {
+			(None, None)
+		};
 		match self.indexes.entry(key) {
 			Entry::Occupied(e) => {
 				// If the building is currently running, we return error
-				if !e.get().1.is_finished() {
-					return Err(Error::IndexAlreadyBuilding {
+				ensure!(
+					e.get().1.is_finished(),
+					Error::IndexAlreadyBuilding {
 						name: e.key().ix.clone(),
-					});
-				}
+					}
+				);
+				let ib = self.start_building(ctx, opt, ix, sdr)?;
+				e.replace_entry(ib);
 			}
 			Entry::Vacant(e) => {
 				// No index is currently building, we can start building it
-				let building = Arc::new(Building::new(ctx, self.tf.clone(), opt, ix)?);
-				let b = building.clone();
-				let jh = task::spawn(async move {
-					if let Err(err) = b.run().await {
-						b.set_status(BuildingStatus::Error(err.into())).await;
-					}
-				});
-				e.insert((building, jh));
+				let ib = self.start_building(ctx, opt, ix, sdr)?;
+				e.insert(ib);
 			}
-		}
-		Ok(())
+		};
+		Ok(rcv)
 	}
 
 	pub(crate) async fn consume(
@@ -192,7 +223,7 @@ impl IndexBuilder {
 		old_values: Option<Vec<Value>>,
 		new_values: Option<Vec<Value>>,
 		rid: &Thing,
-	) -> Result<ConsumeResult, Error> {
+	) -> Result<ConsumeResult> {
 		let key = IndexKey::new(ns, db, &ix.what, &ix.name);
 		if let Some(r) = self.indexes.get(&key) {
 			let (b, _) = r.value();
@@ -215,7 +246,7 @@ impl IndexBuilder {
 		}
 	}
 
-	pub(crate) fn remove_index(&self, ns: &str, db: &str, tb: &str, ix: &str) -> Result<(), Error> {
+	pub(crate) fn remove_index(&self, ns: &str, db: &str, tb: &str, ix: &str) -> Result<()> {
 		let key = IndexKey::new(ns, db, tb, ix);
 		if let Some((_, b)) = self.indexes.remove(&key) {
 			b.0.abort();
@@ -294,12 +325,12 @@ impl Building {
 		tf: TransactionFactory,
 		opt: Options,
 		ix: Arc<DefineIndexStatement>,
-	) -> Result<Self, Error> {
+	) -> Result<Self> {
 		Ok(Self {
 			ctx: MutableContext::new_concurrent(ctx).freeze(),
 			opt,
 			tf,
-			tb: ix.what.to_string(),
+			tb: ix.what.to_raw(),
 			ix,
 			status: Arc::new(RwLock::new(BuildingStatus::Started)),
 			queue: Default::default(),
@@ -321,7 +352,7 @@ impl Building {
 		old_values: Option<Vec<Value>>,
 		new_values: Option<Vec<Value>>,
 		rid: &Thing,
-	) -> Result<ConsumeResult, Error> {
+	) -> Result<ConsumeResult> {
 		let mut queue = self.queue.write().await;
 		// Now that the queue is locked, we have the possibility to assess if the asynchronous build is done.
 		if queue.is_empty() {
@@ -353,30 +384,39 @@ impl Building {
 		Ok(ConsumeResult::Enqueued)
 	}
 
-	fn new_ia_key(&self, i: u32) -> Result<Ia, Error> {
+	fn new_ia_key(&self, i: u32) -> Result<Ia> {
 		let (ns, db) = self.opt.ns_db()?;
 		Ok(Ia::new(ns, db, &self.ix.what, &self.ix.name, i))
 	}
 
-	fn new_ip_key(&self, id: Id) -> Result<Ip, Error> {
+	fn new_ip_key(&self, id: Id) -> Result<Ip> {
 		let (ns, db) = self.opt.ns_db()?;
 		Ok(Ip::new(ns, db, &self.ix.what, &self.ix.name, id))
 	}
 
-	async fn new_read_tx(&self) -> Result<Transaction, Error> {
+	async fn new_read_tx(&self) -> Result<Transaction> {
 		self.tf.transaction(TransactionType::Read, Optimistic).await
 	}
 
-	async fn new_write_tx_ctx(&self) -> Result<Context, Error> {
+	async fn new_write_tx_ctx(&self) -> Result<Context> {
 		let tx = self.tf.transaction(TransactionType::Write, Optimistic).await?.into();
 		let mut ctx = MutableContext::new(&self.ctx);
 		ctx.set_transaction(tx);
 		Ok(ctx.freeze())
 	}
 
-	async fn run(&self) -> Result<(), Error> {
-		// First iteration, we index every keys
+	async fn run(&self) -> Result<()> {
 		let (ns, db) = self.opt.ns_db()?;
+		// Remove the index data
+		{
+			self.set_status(BuildingStatus::Cleaning).await;
+			let ctx = self.new_write_tx_ctx().await?;
+			let key = crate::key::index::all::new(ns, db, &self.tb, &self.ix.name);
+			let tx = ctx.tx();
+			tx.delp(key).await?;
+			tx.commit().await?;
+		}
+		// First iteration, we index every key
 		let beg = thing::prefix(ns, db, &self.tb)?;
 		let end = thing::suffix(ns, db, &self.tb)?;
 		let mut next = Some(beg..end);
@@ -392,6 +432,7 @@ impl Building {
 			if self.is_aborted().await {
 				return Ok(());
 			}
+			self.is_beyond_threshold(None)?;
 			// Get the next batch of records
 			let batch = {
 				let tx = self.new_read_tx().await?;
@@ -404,7 +445,7 @@ impl Building {
 				// If not, we are with the initial indexing
 				break;
 			}
-			// Create a new context with a write transaction
+			// Create a new context with a "write" transaction
 			{
 				let ctx = self.new_write_tx_ctx().await?;
 				let tx = ctx.tx();
@@ -429,6 +470,7 @@ impl Building {
 			if self.is_aborted().await {
 				return Ok(());
 			}
+			self.is_beyond_threshold(None)?;
 			let range = {
 				let mut queue = self.queue.write().await;
 				if let Some(ni) = next_to_index {
@@ -474,13 +516,14 @@ impl Building {
 		tx: &Transaction,
 		values: Vec<(Key, Val)>,
 		count: &mut usize,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		let mut stack = TreeStack::new();
 		// Index the records
 		for (k, v) in values.into_iter() {
 			if self.is_aborted().await {
 				return Ok(());
 			}
+			self.is_beyond_threshold(Some(*count))?;
 			let key = thing::Thing::decode(&k)?;
 			// Parse the value
 			let val: Value = revision::from_slice(&v)?;
@@ -533,12 +576,13 @@ impl Building {
 		range: Range<u32>,
 		initial: usize,
 		count: &mut usize,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		let mut stack = TreeStack::new();
 		for i in range {
 			if self.is_aborted().await {
 				return Ok(());
 			}
+			self.is_beyond_threshold(Some(*count))?;
 			let ia = self.new_ia_key(i)?;
 			if let Some(v) = tx.get(ia.clone(), None).await? {
 				tx.del(ia).await?;
@@ -580,6 +624,19 @@ impl Building {
 			true
 		} else {
 			false
+		}
+	}
+
+	fn is_beyond_threshold(&self, count: Option<usize>) -> Result<()> {
+		if let Some(count) = count {
+			if count % 100 != 0 {
+				return Ok(());
+			}
+		}
+		if ALLOC.is_beyond_threshold() {
+			Err(anyhow::Error::new(Error::QueryBeyondMemoryThreshold))
+		} else {
+			Ok(())
 		}
 	}
 }

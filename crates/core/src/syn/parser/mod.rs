@@ -8,15 +8,15 @@
 //!
 //! There are a bunch of common patterns for which this module has some confinence functions.
 //! - Whenever only one token can be next you should use the `expected!` macro. This macro
-//!     ensures that the given token type is next and if not returns a parser error.
+//!   ensures that the given token type is next and if not returns a parser error.
 //! - Whenever a limited set of tokens can be next it is common to match the token kind and then
-//!     have a catch all arm which calles the macro `unexpected!`. This macro will raise an parse
-//!     error with information about the type of token it recieves and what it expected.
+//!   have a catch all arm which calles the macro `unexpected!`. This macro will raise an parse
+//!   error with information about the type of token it recieves and what it expected.
 //! - If a single token can be optionally next use [`Parser::eat`] this function returns a bool
-//!     depending on if the given tokenkind was eaten.
+//!   depending on if the given tokenkind was eaten.
 //! - If a closing delimiting token is expected use `Parser::expect_closing_delimiter`. This
-//!     function will raise an error if the expected delimiter isn't the next token. This error will
-//!     also point to which delimiter the parser expected to be closed.
+//!   function will raise an error if the expected delimiter isn't the next token. This error will
+//!   also point to which delimiter the parser expected to be closed.
 //!
 //! ## Far Token Peek
 //!
@@ -55,11 +55,11 @@
 
 use self::token_buffer::TokenBuffer;
 use crate::{
-	sql::{self, Datetime, Duration, Strand, Uuid},
+	sql::{self, Bytes, Datetime, Duration, File, Strand, Uuid},
 	syn::{
-		error::{bail, SyntaxError},
-		lexer::{compound::NumberKind, Lexer},
-		token::{t, Span, Token, TokenKind},
+		error::{SyntaxError, bail},
+		lexer::{Lexer, compound::NumberKind},
+		token::{Span, Token, TokenKind, t},
 	},
 };
 use bytes::BytesMut;
@@ -83,7 +83,7 @@ mod token_buffer;
 
 pub(crate) use mac::{enter_object_recursion, enter_query_recursion, unexpected};
 
-use super::error::{syntax_error, RenderedError};
+use super::error::{RenderedError, syntax_error};
 
 #[cfg(test)]
 pub mod test;
@@ -119,6 +119,8 @@ pub enum GluedValue {
 	Strand(Strand),
 	#[default]
 	None,
+	Bytes(Bytes),
+	File(File),
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +145,8 @@ pub struct ParserSettings {
 	pub bearer_access_enabled: bool,
 	/// Whether bearer access is enabled
 	pub define_api_enabled: bool,
+	/// Whether the files feature is enabled
+	pub files_enabled: bool,
 }
 
 impl Default for ParserSettings {
@@ -155,6 +159,7 @@ impl Default for ParserSettings {
 			references_enabled: false,
 			bearer_access_enabled: false,
 			define_api_enabled: false,
+			files_enabled: false,
 		}
 	}
 }
@@ -193,7 +198,7 @@ impl<'a> Parser<'a> {
 	}
 
 	/// Returns the next token and advance the parser one token forward.
-	#[allow(clippy::should_implement_trait)]
+	#[expect(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Token {
 		let res = loop {
 			let res = self.token_buffer.pop().unwrap_or_else(|| self.lexer.next_token());
@@ -208,7 +213,6 @@ impl<'a> Parser<'a> {
 	/// Returns the next token and advance the parser one token forward.
 	///
 	/// This function is like next but returns whitespace tokens which are normally skipped
-	#[allow(clippy::should_implement_trait)]
 	pub fn next_whitespace(&mut self) -> Token {
 		let res = self.token_buffer.pop().unwrap_or_else(|| self.lexer.next_token());
 		self.last_span = res.span;
@@ -398,7 +402,7 @@ pub struct StatementStream {
 }
 
 impl StatementStream {
-	#[allow(clippy::new_without_default)]
+	#[expect(clippy::new_without_default)]
 	pub fn new() -> Self {
 		Self::new_with_settings(ParserSettings::default())
 	}

@@ -8,6 +8,17 @@ pub struct Schedular {
 	join: JoinSet<()>,
 }
 
+pub struct SemaphoreGuard {
+	semaphore: Arc<Semaphore>,
+	count: u32,
+}
+
+impl Drop for SemaphoreGuard {
+	fn drop(&mut self) {
+		self.semaphore.add_permits(self.count as usize);
+	}
+}
+
 impl Schedular {
 	pub fn new(max_jobs: u32) -> Self {
 		assert!(max_jobs > 0);
@@ -24,10 +35,13 @@ impl Schedular {
 	{
 		// never call close, so this should not panic.
 		self.job_lock.acquire().await.unwrap().forget();
-		let lock = self.job_lock.clone();
+		let guard = SemaphoreGuard {
+			semaphore: self.job_lock.clone(),
+			count: 1,
+		};
 		self.join.spawn(async move {
-			lock.add_permits(1);
-			f.await
+			let _guard = guard;
+			f.await;
 		});
 	}
 
@@ -37,11 +51,14 @@ impl Schedular {
 	{
 		let max_jobs = self.max_jobs;
 		self.job_lock.acquire_many(max_jobs).await.unwrap().forget();
+		let guard = SemaphoreGuard {
+			semaphore: self.job_lock.clone(),
+			count: max_jobs,
+		};
 		// never call close, so this should not panic.
-		let lock = self.job_lock.clone();
 		self.join.spawn(async move {
-			lock.add_permits(max_jobs as usize);
-			f.await
+			let _guard = guard;
+			f.await;
 		});
 	}
 

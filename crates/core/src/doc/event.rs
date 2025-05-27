@@ -2,8 +2,9 @@ use crate::ctx::{Context, MutableContext};
 use crate::dbs::Options;
 use crate::dbs::Statement;
 use crate::doc::Document;
-use crate::err::Error;
-use crate::sql::value::Value;
+use crate::expr::FlowResultExt as _;
+use crate::expr::value::Value;
+use anyhow::Result;
 use reblessive::tree::Stk;
 
 impl Document {
@@ -18,7 +19,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Check import
 		if opt.import {
 			return Ok(());
@@ -55,11 +56,11 @@ impl Document {
 			// Freeze the context
 			let ctx = ctx.freeze();
 			// Process conditional clause
-			let val = ev.when.compute(stk, &ctx, opt, Some(doc)).await?;
+			let val = ev.when.compute(stk, &ctx, opt, Some(doc)).await.catch_return()?;
 			// Execute event if value is truthy
 			if val.is_truthy() {
 				for v in ev.then.iter() {
-					v.compute(stk, &ctx, opt, Some(doc)).await?;
+					v.compute(stk, &ctx, opt, Some(doc)).await.catch_return()?;
 				}
 			}
 		}

@@ -1,29 +1,30 @@
 use crate::ctx::{Context, MutableContext};
 use crate::err::Error;
+use crate::expr::cond::Cond;
+use crate::expr::data::Data;
+use crate::expr::fetch::Fetchs;
+use crate::expr::field::Fields;
+use crate::expr::group::Groups;
+use crate::expr::idiom::Idioms;
+use crate::expr::limit::Limit;
+use crate::expr::order::Ordering;
+use crate::expr::output::Output;
+use crate::expr::split::Splits;
+use crate::expr::start::Start;
+use crate::expr::statements::DefineTableStatement;
+use crate::expr::statements::access::AccessStatement;
+use crate::expr::statements::create::CreateStatement;
+use crate::expr::statements::delete::DeleteStatement;
+use crate::expr::statements::insert::InsertStatement;
+use crate::expr::statements::live::LiveStatement;
+use crate::expr::statements::relate::RelateStatement;
+use crate::expr::statements::select::SelectStatement;
+use crate::expr::statements::show::ShowStatement;
+use crate::expr::statements::update::UpdateStatement;
+use crate::expr::statements::upsert::UpsertStatement;
+use crate::expr::{Explain, Permission, Timeout, With};
 use crate::idx::planner::QueryPlanner;
-use crate::sql::cond::Cond;
-use crate::sql::data::Data;
-use crate::sql::fetch::Fetchs;
-use crate::sql::field::Fields;
-use crate::sql::group::Groups;
-use crate::sql::idiom::Idioms;
-use crate::sql::limit::Limit;
-use crate::sql::order::Ordering;
-use crate::sql::output::Output;
-use crate::sql::split::Splits;
-use crate::sql::start::Start;
-use crate::sql::statements::access::AccessStatement;
-use crate::sql::statements::create::CreateStatement;
-use crate::sql::statements::delete::DeleteStatement;
-use crate::sql::statements::insert::InsertStatement;
-use crate::sql::statements::live::LiveStatement;
-use crate::sql::statements::relate::RelateStatement;
-use crate::sql::statements::select::SelectStatement;
-use crate::sql::statements::show::ShowStatement;
-use crate::sql::statements::update::UpdateStatement;
-use crate::sql::statements::upsert::UpsertStatement;
-use crate::sql::statements::DefineTableStatement;
-use crate::sql::{Explain, Permission, Timeout, With};
+use anyhow::Result;
 use std::borrow::Cow;
 use std::fmt;
 
@@ -134,12 +135,6 @@ impl Statement<'_> {
 		matches!(self, Statement::Delete(_))
 	}
 
-	/// Returns whether the IGNORE clause has
-	/// been specified on an INSERT statement
-	pub(crate) fn is_ignore(&self) -> bool {
-		matches!(self, Statement::Insert(i) if i.ignore)
-	}
-
 	/// Returns whether the document retrieval for
 	/// this statement can be deferred. This is used
 	/// in the following instances:
@@ -246,20 +241,6 @@ impl Statement<'_> {
 	/// UPSERT some WHERE test = true;
 	pub(crate) fn is_guaranteed(&self) -> bool {
 		matches!(self, Statement::Upsert(v) if v.cond.is_some())
-	}
-
-	/// Returns whether the document processing for
-	/// this statement can be retried, and therefore
-	/// whether we need to use savepoints in this
-	/// transaction. This is specifically used in
-	/// UPSERT statements, and INSERT statements which
-	/// have an ON DUPLICATE KEY UPDATE clause.
-	pub(crate) fn is_retryable(&self) -> bool {
-		match self {
-			Statement::Insert(_) if self.data().is_some() => true,
-			Statement::Upsert(_) => true,
-			_ => false,
-		}
 	}
 
 	/// Returns any query fields if specified

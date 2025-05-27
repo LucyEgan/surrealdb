@@ -5,12 +5,14 @@ use crate::dbs::Workable;
 use crate::doc::Document;
 use crate::doc::Permitted::*;
 use crate::err::Error;
-use crate::sql::data::Data;
-use crate::sql::operator::Operator;
-use crate::sql::paths::EDGE;
-use crate::sql::paths::IN;
-use crate::sql::paths::OUT;
-use crate::sql::value::Value;
+use crate::expr::FlowResultExt;
+use crate::expr::data::Data;
+use crate::expr::operator::Operator;
+use crate::expr::paths::EDGE;
+use crate::expr::paths::IN;
+use crate::expr::paths::OUT;
+use crate::expr::value::Value;
+use anyhow::{Result, bail, ensure};
 use reblessive::tree::Stk;
 use std::sync::Arc;
 
@@ -26,9 +28,9 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Check if we need to generate a record id
-		if let Some(tb) = &self.gen {
+		if let Some(tb) = &self.r#gen {
 			// This is a CREATE, UPSERT, UPDATE statement
 			if let Workable::Normal = &self.extras {
 				// Fetch the record id if specified
@@ -44,11 +46,12 @@ impl Document {
 					None => tb.generate(),
 				};
 				// The id field can not be a record range
-				if id.is_range() {
-					return Err(Error::IdInvalid {
+				ensure!(
+					!id.is_range(),
+					Error::IdInvalid {
 						value: id.to_string(),
-					});
-				}
+					}
+				);
 				// Set the document id
 				self.id = Some(Arc::new(id));
 			}
@@ -69,13 +72,8 @@ impl Document {
 	/// of the document within a `DELETE` statement.
 	/// This function only clears the document in
 	/// memory, and does not store this on disk.
-	pub(super) async fn clear_record_data(
-		&mut self,
-		_ctx: &Context,
-		_opt: &Options,
-		_stm: &Statement<'_>,
-	) -> Result<(), Error> {
-		self.current.doc.to_mut().clear()
+	pub(super) fn clear_record_data(&mut self) {
+		*self.current.doc.to_mut() = Value::None
 	}
 	/// Sets the default field data that should be
 	/// present on this document. For normal records
@@ -89,7 +87,7 @@ impl Document {
 		_ctx: &Context,
 		_opt: &Options,
 		_stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Get the record id
 		let rid = self.id()?;
 		// Set default field values
@@ -110,7 +108,7 @@ impl Document {
 				}
 				// Otherwise this is attempting to override the `in` field
 				(v, _) => {
-					return Err(Error::InOverride {
+					bail!(Error::InOverride {
 						value: v.to_string(),
 					})
 				}
@@ -127,7 +125,7 @@ impl Document {
 				}
 				// Otherwise this is attempting to override the `in` field
 				(v, _) => {
-					return Err(Error::OutOverride {
+					bail!(Error::OutOverride {
 						value: v.to_string(),
 					})
 				}
@@ -155,7 +153,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		_stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Get the record id
 		let rid = self.id()?;
 		// Set default field values
@@ -165,24 +163,30 @@ impl Document {
 			true => {
 				// This is an INSERT statement
 				if let Workable::Insert(v) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current_reduced)).await?;
+					let v = v
+						.compute(stk, ctx, opt, Some(&self.current_reduced))
+						.await
+						.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 				// This is an INSERT RELATION statement
 				if let Workable::Relate(_, _, Some(v)) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current_reduced)).await?;
+					let v = v
+						.compute(stk, ctx, opt, Some(&self.current_reduced))
+						.await
+						.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 			}
 			false => {
 				// This is an INSERT statement
 				if let Workable::Insert(v) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current)).await?;
+					let v = v.compute(stk, ctx, opt, Some(&self.current)).await.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 				// This is an INSERT RELATION statement
 				if let Workable::Relate(_, _, Some(v)) = &self.extras {
-					let v = v.compute(stk, ctx, opt, Some(&self.current)).await?;
+					let v = v.compute(stk, ctx, opt, Some(&self.current)).await.catch_return()?;
 					self.current.doc.to_mut().merge(v)?;
 				}
 			}
@@ -205,7 +209,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		stm: &Statement<'_>,
-	) -> Result<(), Error> {
+	) -> Result<()> {
 		// Get the record id
 		let rid = self.id()?;
 		// Set default field values
@@ -220,7 +224,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the PATCH data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().patch(data)?
 				}
 				Data::MergeExpression(data) => {
@@ -230,7 +234,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the MERGE data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().merge(data)?
 				}
 				Data::ReplaceExpression(data) => {
@@ -240,7 +244,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the REPLACE data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().replace(data)?
 				}
 				Data::ContentExpression(data) => {
@@ -250,7 +254,7 @@ impl Document {
 						false => &self.current,
 					};
 					// Process the CONTENT data clause
-					let data = data.compute(stk, ctx, opt, Some(current)).await?;
+					let data = data.compute(stk, ctx, opt, Some(current)).await.catch_return()?;
 					self.current.doc.to_mut().replace(data)?
 				}
 				Data::UnsetExpression(i) => {
@@ -262,7 +266,7 @@ impl Document {
 					true => {
 						for x in x.iter() {
 							#[rustfmt::skip]
-							let v = x.2.compute(stk, ctx, opt, Some(&self.current_reduced)).await?;
+							let v = x.2.compute(stk, ctx, opt, Some(&self.current_reduced)).await.catch_return()?;
 							match &x.1 {
 								#[rustfmt::skip]
 								Operator::Equal => match v {
@@ -291,14 +295,14 @@ impl Document {
 									self.current.doc.to_mut().extend(stk, ctx, opt, &x.0, v).await?;
 								}
 								#[rustfmt::skip]
-								o => { return Err(fail!("Unexpected operator in SET clause: {o:?}")); }
+								o => fail!("Unexpected operator in SET clause: {o:?}"),
 							}
 						}
 					}
 					false => {
 						for x in x.iter() {
 							#[rustfmt::skip]
-							let v = x.2.compute(stk, ctx, opt, Some(&self.current)).await?;
+							let v = x.2.compute(stk, ctx, opt, Some(&self.current)).await.catch_return()?;
 							match &x.1 {
 								#[rustfmt::skip]
 								Operator::Equal => match v {
@@ -312,7 +316,7 @@ impl Document {
 								#[rustfmt::skip]
 								Operator::Ext => self.current.doc.to_mut().extend(stk, ctx, opt, &x.0, v).await?,
 								#[rustfmt::skip]
-								o => { return Err(fail!("Unexpected operator in SET clause: {o:?}")); }
+								o => fail!("Unexpected operator in SET clause: {o:?}"),
 							}
 						}
 					}
@@ -334,7 +338,7 @@ impl Document {
 						true => {
 							for x in x.iter() {
 								#[rustfmt::skip]
-								let v = x.2.compute(stk, &ctx, opt, Some(&self.current_reduced)).await?;
+								let v = x.2.compute(stk, &ctx, opt, Some(&self.current_reduced)).await.catch_return()?;
 								match &x.1 {
 									#[rustfmt::skip]
 									Operator::Equal => match v {
@@ -363,14 +367,14 @@ impl Document {
 										self.current.doc.to_mut().extend(stk, &ctx, opt, &x.0, v).await?;
 									}
 									#[rustfmt::skip]
-									o => { return Err(fail!("Unexpected operator in UPDATE clause: {o:?}")); }
+									o => fail!("Unexpected operator in UPDATE clause: {o:?}"),
 								}
 							}
 						}
 						false => {
 							for x in x.iter() {
 								#[rustfmt::skip]
-								let v = x.2.compute(stk, &ctx, opt, Some(&self.current)).await?;
+								let v = x.2.compute(stk, &ctx, opt, Some(&self.current)).await.catch_return()?;
 								match &x.1 {
 									#[rustfmt::skip]
 									Operator::Equal => match v {
@@ -384,13 +388,13 @@ impl Document {
 									#[rustfmt::skip]
 									Operator::Ext => self.current.doc.to_mut().extend(stk, &ctx, opt, &x.0, v).await?,
 									#[rustfmt::skip]
-									o => { return Err(fail!("Unexpected operator in UPDATE clause: {o:?}")); }
+									o => fail!("Unexpected operator in UPDATE clause: {o:?}"),
 								}
 							}
 						}
 					}
 				}
-				x => return Err(fail!("Unexpected data clause type: {x:?}")),
+				x => fail!("Unexpected data clause type: {x:?}"),
 			};
 		};
 		// Set default field values

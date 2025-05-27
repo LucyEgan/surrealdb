@@ -1,14 +1,16 @@
-pub mod schema;
-pub mod testset;
+use anyhow::{Context, Result, bail};
+use schema::TestConfig;
+use serde::{Deserialize, de::IntoDeserializer};
+use set::TestId;
+pub use set::TestSet;
 use std::ops::Range;
 use std::sync::Arc;
-
-use anyhow::{bail, Context, Result};
-use camino::Utf8PathBuf;
-use schema::TestConfig;
-use serde::{de::IntoDeserializer, Deserialize};
-pub use testset::TestSet;
 use toml_edit::DocumentMut;
+
+pub mod cmp;
+pub mod report;
+pub mod schema;
+pub mod set;
 
 struct Parser<'a> {
 	chars: &'a [u8],
@@ -58,17 +60,24 @@ pub enum ConfigKind {
 	None,
 }
 
+pub struct ResolvedImport {
+	pub id: TestId,
+	pub path: String,
+}
+
 pub struct TestCase {
-	pub path: Utf8PathBuf,
+	pub path: String,
 	pub toml: DocumentMut,
 	pub config: Arc<TestConfig>,
 	pub source: Vec<u8>,
 	pub config_slice: Range<usize>,
 	pub config_kind: ConfigKind,
+	pub imports: Vec<ResolvedImport>,
+	pub contains_error: bool,
 }
 
 impl TestCase {
-	pub fn from_source_path(path: Utf8PathBuf, source: Vec<u8>) -> Result<Self> {
+	pub fn from_source_path(path: String, source: Vec<u8>) -> Result<Self> {
 		let (range, config_kind, config_source) = Self::extract_config_text(&source)?;
 
 		let config_source =
@@ -92,6 +101,8 @@ impl TestCase {
 			path,
 			config_slice: range,
 			config_kind,
+			imports: Vec::new(),
+			contains_error: false,
 		})
 	}
 

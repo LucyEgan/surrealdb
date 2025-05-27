@@ -3,22 +3,24 @@ use crate::ctx::MutableContext;
 use crate::dbs::Options;
 use crate::dbs::Workable;
 use crate::err::Error;
+use crate::expr::Base;
+use crate::expr::FlowResultExt as _;
+use crate::expr::permission::Permission;
+use crate::expr::statements::define::DefineDatabaseStatement;
+use crate::expr::statements::define::DefineEventStatement;
+use crate::expr::statements::define::DefineFieldStatement;
+use crate::expr::statements::define::DefineIndexStatement;
+use crate::expr::statements::define::DefineTableStatement;
+use crate::expr::statements::live::LiveStatement;
+use crate::expr::table::Table;
+use crate::expr::thing::Thing;
+use crate::expr::value::Value;
 use crate::iam::Action;
 use crate::iam::ResourceKind;
-use crate::idx::planner::iterators::IteratorRecord;
 use crate::idx::planner::RecordStrategy;
+use crate::idx::planner::iterators::IteratorRecord;
 use crate::kvs::cache;
-use crate::sql::permission::Permission;
-use crate::sql::statements::define::DefineDatabaseStatement;
-use crate::sql::statements::define::DefineEventStatement;
-use crate::sql::statements::define::DefineFieldStatement;
-use crate::sql::statements::define::DefineIndexStatement;
-use crate::sql::statements::define::DefineTableStatement;
-use crate::sql::statements::live::LiveStatement;
-use crate::sql::table::Table;
-use crate::sql::thing::Thing;
-use crate::sql::value::Value;
-use crate::sql::Base;
+use anyhow::Result;
 use reblessive::tree::Stk;
 use std::fmt::{Debug, Formatter};
 use std::mem;
@@ -29,7 +31,7 @@ pub(crate) struct Document {
 	/// The record id of this document
 	pub(super) id: Option<Arc<Thing>>,
 	/// The table that we should generate a record id from
-	pub(super) gen: Option<Table>,
+	pub(super) r#gen: Option<Table>,
 	/// Whether this is the second iteration of the processing
 	pub(super) retry: bool,
 	pub(super) extras: Workable,
@@ -173,7 +175,7 @@ impl Document {
 	pub fn new(
 		id: Option<Arc<Thing>>,
 		ir: Option<Arc<IteratorRecord>>,
-		gen: Option<Table>,
+		r#gen: Option<Table>,
 		val: Arc<Value>,
 		extras: Workable,
 		retry: bool,
@@ -181,7 +183,7 @@ impl Document {
 	) -> Self {
 		Document {
 			id: id.clone(),
-			gen,
+			r#gen,
 			retry,
 			extras,
 			current: CursorDoc::new(id.clone(), ir.clone(), val.clone()),
@@ -245,7 +247,7 @@ impl Document {
 	pub(crate) fn is_specific_record_id(&self) -> bool {
 		match self.extras {
 			Workable::Insert(ref v) if v.rid().is_some() => true,
-			Workable::Normal if self.gen.is_none() => true,
+			Workable::Normal if self.r#gen.is_none() => true,
 			_ => false,
 		}
 	}
@@ -253,6 +255,18 @@ impl Document {
 	/// Retur true if the document has been extracted by an iterator that already matcheed the condition.
 	pub(crate) fn is_condition_checked(&self) -> bool {
 		matches!(self.record_strategy, RecordStrategy::Count | RecordStrategy::KeysOnly)
+	}
+
+	/// Update the document for a retry to update after an insert failed.
+	pub fn modify_for_update_retry(&mut self, id: Thing, value: Arc<Value>) {
+		let retry = Arc::new(id);
+		self.id = Some(retry.clone());
+		self.r#gen = None;
+		self.retry = true;
+		self.record_strategy = RecordStrategy::KeysAndValues;
+
+		self.current = CursorDoc::new(Some(retry), None, value);
+		self.initial = self.current.clone();
 	}
 
 	/// Checks if permissions are required to be run
@@ -288,7 +302,7 @@ impl Document {
 		ctx: &Context,
 		opt: &Options,
 		permitted: Permitted,
-	) -> Result<bool, Error> {
+	) -> Result<bool> {
 		// Check if this record exists
 		if self.id.is_none() {
 			return Ok(false);
@@ -313,7 +327,8 @@ impl Document {
 			// Get the full document
 			let full = target.0;
 			// Process the full document
-			let mut out = full.doc.as_ref().compute(stk, ctx, opt, Some(full)).await?;
+			let mut out =
+				full.doc.as_ref().compute(stk, ctx, opt, Some(full)).await.catch_return()?;
 			// Loop over each field in document
 			for fd in fds.iter() {
 				// Loop over each field in document
@@ -332,7 +347,12 @@ impl Document {
 							ctx.add_value("value", val);
 							let ctx = ctx.freeze();
 							// Process the PERMISSION clause
-							if !e.compute(stk, &ctx, opt, Some(full)).await?.is_truthy() {
+							if !e
+								.compute(stk, &ctx, opt, Some(full))
+								.await
+								.catch_return()?
+								.is_truthy()
+							{
 								out.cut(k);
 							}
 						}
@@ -347,27 +367,23 @@ impl Document {
 	}
 
 	/// Retrieve the record id for this document
-	pub fn id(&self) -> Result<Arc<Thing>, Error> {
+	pub fn id(&self) -> Result<Arc<Thing>> {
 		match self.id.clone() {
 			Some(id) => Ok(id),
-			_ => Err(fail!("Expected a document id to be present")),
+			_ => fail!("Expected a document id to be present"),
 		}
 	}
 
 	/// Retrieve the record id for this document
-	pub fn inner_id(&self) -> Result<Thing, Error> {
+	pub fn inner_id(&self) -> Result<Thing> {
 		match self.id.clone() {
 			Some(id) => Ok(Arc::unwrap_or_clone(id)),
-			_ => Err(fail!("Expected a document id to be present")),
+			_ => fail!("Expected a document id to be present"),
 		}
 	}
 
 	/// Get the database for this document
-	pub async fn db(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-	) -> Result<Arc<DefineDatabaseStatement>, Error> {
+	pub async fn db(&self, ctx: &Context, opt: &Options) -> Result<Arc<DefineDatabaseStatement>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get transaction
@@ -396,11 +412,7 @@ impl Document {
 	}
 
 	/// Get the table for this document
-	pub async fn tb(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-	) -> Result<Arc<DefineTableStatement>, Error> {
+	pub async fn tb(&self, ctx: &Context, opt: &Options) -> Result<Arc<DefineTableStatement>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get the record id
@@ -418,17 +430,18 @@ impl Document {
 					Some(val) => val,
 					None => {
 						let val = match txn.get_tb(ns, db, &id.tb).await {
-							// The table doesn't exist
-							Err(Error::TbNotFound {
-								name: _,
-							}) => {
-								// Allowed to run?
-								opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
-								// We can create the table automatically
-								txn.ensure_ns_db_tb(ns, db, &id.tb, opt.strict).await
+							Err(e) => {
+								// The table doesn't exist
+								if matches!(e.downcast_ref(), Some(Error::TbNotFound { .. })) {
+									// Allowed to run?
+									opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
+									// We can create the table automatically
+									txn.ensure_ns_db_tb(ns, db, &id.tb, opt.strict).await
+								} else {
+									// There was an error
+									Err(e)
+								}
 							}
-							// There was an error
-							Err(err) => Err(err),
 							// The table exists
 							Ok(tb) => Ok(tb),
 						}?;
@@ -443,17 +456,18 @@ impl Document {
 			_ => {
 				// Return the table or attempt to define it
 				match txn.get_tb(ns, db, &id.tb).await {
-					// The table doesn't exist
-					Err(Error::TbNotFound {
-						name: _,
-					}) => {
-						// Allowed to run?
-						opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
-						// We can create the table automatically
-						txn.ensure_ns_db_tb(ns, db, &id.tb, opt.strict).await
+					Err(e) => {
+						// The table doesn't exist
+						if matches!(e.downcast_ref(), Some(Error::TbNotFound { .. })) {
+							// Allowed to run?
+							opt.is_allowed(Action::Edit, ResourceKind::Table, &Base::Db)?;
+							// We can create the table automatically
+							txn.ensure_ns_db_tb(ns, db, &id.tb, opt.strict).await
+						} else {
+							// There was an error
+							Err(e)
+						}
 					}
-					// There was an error
-					Err(err) => Err(err),
 					// The table exists
 					Ok(tb) => Ok(tb),
 				}
@@ -462,11 +476,7 @@ impl Document {
 	}
 
 	/// Get the foreign tables for this document
-	pub async fn ft(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-	) -> Result<Arc<[DefineTableStatement]>, Error> {
+	pub async fn ft(&self, ctx: &Context, opt: &Options) -> Result<Arc<[DefineTableStatement]>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get the document table
@@ -495,11 +505,7 @@ impl Document {
 	}
 
 	/// Get the events for this document
-	pub async fn ev(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-	) -> Result<Arc<[DefineEventStatement]>, Error> {
+	pub async fn ev(&self, ctx: &Context, opt: &Options) -> Result<Arc<[DefineEventStatement]>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get the document table
@@ -528,11 +534,7 @@ impl Document {
 	}
 
 	/// Get the fields for this document
-	pub async fn fd(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-	) -> Result<Arc<[DefineFieldStatement]>, Error> {
+	pub async fn fd(&self, ctx: &Context, opt: &Options) -> Result<Arc<[DefineFieldStatement]>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get the document table
@@ -561,11 +563,7 @@ impl Document {
 	}
 
 	/// Get the indexes for this document
-	pub async fn ix(
-		&self,
-		ctx: &Context,
-		opt: &Options,
-	) -> Result<Arc<[DefineIndexStatement]>, Error> {
+	pub async fn ix(&self, ctx: &Context, opt: &Options) -> Result<Arc<[DefineIndexStatement]>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get the document table
@@ -594,7 +592,7 @@ impl Document {
 	}
 
 	// Get the lives for this document
-	pub async fn lv(&self, ctx: &Context, opt: &Options) -> Result<Arc<[LiveStatement]>, Error> {
+	pub async fn lv(&self, ctx: &Context, opt: &Options) -> Result<Arc<[LiveStatement]>> {
 		// Get the NS + DB
 		let (ns, db) = opt.ns_db()?;
 		// Get the document table

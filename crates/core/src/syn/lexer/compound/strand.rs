@@ -2,9 +2,9 @@ use std::ops::RangeInclusive;
 use std::{char, mem};
 
 use crate::syn::{
-	error::{bail, syntax_error, SyntaxError},
-	lexer::{unicode::chars, Lexer},
-	token::{t, Token},
+	error::{SyntaxError, bail, syntax_error},
+	lexer::{Lexer, unicode::chars},
+	token::{Token, t},
 };
 
 pub fn strand(lexer: &mut Lexer, start: Token) -> Result<String, SyntaxError> {
@@ -130,8 +130,14 @@ fn lex_unicode_sequence(lexer: &mut Lexer) -> Result<char, SyntaxError> {
 		});
 	}
 
-	char::from_u32(leading as u32)
-		.ok_or_else(|| syntax_error!("Unicode escape sequences encode invalid character codepoint", @lexer.current_span()))
+	let c = char::from_u32(leading as u32)
+		.ok_or_else(|| syntax_error!("Unicode escape sequences encode invalid character codepoint", @lexer.current_span()))?;
+
+	if c == '\0' {
+		return Err(syntax_error!("Null bytes are not allowed in strings",@lexer.current_span()));
+	}
+
+	Ok(c)
 }
 
 fn lex_bracket_unicode_sequence(lexer: &mut Lexer) -> Result<char, SyntaxError> {
@@ -163,8 +169,14 @@ fn lex_bracket_unicode_sequence(lexer: &mut Lexer) -> Result<char, SyntaxError> 
 		bail!("Missing end brace `}}` of unicode escape sequence", @lexer.current_span())
 	};
 
-	char::from_u32(accum)
-		.ok_or_else(|| syntax_error!("Unicode escape sequences encode invalid character codepoint", @lexer.current_span()))
+	let c = char::from_u32(accum)
+		.ok_or_else(|| syntax_error!("Unicode escape sequences encode invalid character codepoint", @lexer.current_span()))?;
+
+	if c == '\0' {
+		return Err(syntax_error!("Null bytes are not allowed in strings",@lexer.current_span()));
+	}
+
+	Ok(c)
 }
 
 fn lex_bare_unicode_sequence(lexer: &mut Lexer) -> Result<u16, SyntaxError> {
